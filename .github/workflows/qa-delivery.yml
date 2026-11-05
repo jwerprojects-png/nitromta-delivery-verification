@@ -1,0 +1,130 @@
+name: NitroMTA delivery verification
+on:
+  push:
+    paths: ['.github/workflows/qa-delivery.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Verify official release provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 2 --output nitromta.tar.gz https://github.com/nitrosend/nitromta/releases/download/v0.2.1/nitromta-0.2.1-x86_64-linux.tar.gz
+          gh attestation verify nitromta.tar.gz --repo nitrosend/nitromta
+          tar -xzf nitromta.tar.gz
+          find "$PWD" -type f -name nitromta -perm -u+x -print -quit > binary-path.txt
+          test -s binary-path.txt
+      - name: Exercise a real TLS delivery
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, platform, re, smtplib, socket, ssl, subprocess, time, urllib.request
+          from datetime import datetime, timezone
+          from email.message import EmailMessage
+          root = pathlib.Path.cwd()
+          binary = pathlib.Path('binary-path.txt').read_text().strip()
+          work = root / 'qa-private'
+          work.mkdir(mode=0o700)
+          os.chdir(work)
+          started = time.monotonic()
+          stamp = datetime.now(timezone.utc).isoformat()
+          observations, commands = [], []
+          def run(args, *, data=None, record=True):
+              if record: commands.append(' '.join(args))
+              p = subprocess.run(args, input=data, text=True, capture_output=True, timeout=45)
+              if p.returncode: raise RuntimeError(f'{args[1]} failed (exit {p.returncode}): {p.stderr[:600]}')
+              return p.stdout
+          version = run([binary, '--version']).strip()
+          run([binary, 'setup', '--config', 'config.toml', '--capture'])
+          config = pathlib.Path('config.toml').read_text()
+          config, removed = re.subn(r'(?ms)^\[capture\]\s*\n.*?(?=^\[|\Z)', '', config)
+          if removed != 1: raise RuntimeError('Expected exactly one capture table; refusing to guess configuration')
+          if '# port = 25' not in config: raise RuntimeError('Expected documented delivery port setting')
+          config = config.replace('# port = 25', 'port = 2525', 1)
+          pathlib.Path('config.toml').write_text(config)
+          observations.append('Removed the [capture] table and set [delivery] port = 2525; TLS remained required.')
+          run(['openssl', 'genpkey', '-algorithm', 'RSA', '-pkeyopt', 'rsa_keygen_bits:2048', '-out', 'dkim.pem'])
+          log = open('engine.log', 'w')
+          engine = subprocess.Popen([binary, 'run', '--config', 'config.toml'], stdout=log, stderr=subprocess.STDOUT)
+          commands.append('nitromta run --config config.toml (background, unprivileged runner user)')
+          delivered = False
+          try:
+              for _ in range(60):
+                  if engine.poll() is not None: raise RuntimeError('Engine exited before becoming ready')
+                  try:
+                      with urllib.request.urlopen('http://127.0.0.1:9090/health/accept', timeout=1) as response:
+                          if response.status == 200: break
+                  except (OSError, urllib.error.URLError): time.sleep(.5)
+              else: raise RuntimeError('Engine readiness timed out')
+              policy = [dict(op='put_account', account=1), dict(op='put_identity', account=1, name='jwerprojects.example', selector='qa', private_key=pathlib.Path('dkim.pem').read_text()), dict(op='create_login', account=1, user='qa')]
+              answer = run([binary, 'admin', '--config', 'config.toml'], data='\n'.join(json.dumps(item) for item in policy)+'\n')
+              responses = [json.loads(line) for line in answer.splitlines() if line.strip()]
+              for item in responses:
+                  if 'error' in item or 'err' in item: raise RuntimeError('Native policy request was refused')
+              password = responses[-1]['ok']['password']
+              print('::add-mask::'+password)
+              observations.append('Created one local account, a DKIM identity under the reserved example domain, and a generated SMTP login. Credentials are excluded from evidence.')
+              message = EmailMessage()
+              subject = 'Jwer Projects NitroMTA delivery check ' + stamp
+              message['From'] = 'Jwer Projects QA <qa@jwerprojects.example>'
+              message['To'] = 'proof@nitromta.com'
+              message['Reply-To'] = 'jwerprojects@gmail.com'
+              message['Subject'] = subject
+              message.set_content('This is one genuine NitroMTA delivery verification by Jwer Projects. Please return the delivery receipt to the Reply-To address. No marketing campaign or third-party recipient is involved.')
+              tls = ssl.create_default_context(cafile='tls.crt')
+              with smtplib.SMTP('127.0.0.1', 2587, timeout=30) as smtp:
+                  smtp.ehlo()
+                  smtp.starttls(context=tls)
+                  smtp.ehlo()
+                  smtp.login('qa', password)
+                  refused = smtp.send_message(message)
+                  if refused: raise RuntimeError('SMTP submission refused a recipient')
+              observations.append('Submitted exactly one message to proof@nitromta.com via localhost SMTP with certificate-verified STARTTLS and generated authentication.')
+              metrics = ''
+              for _ in range(60):
+                  with urllib.request.urlopen('http://127.0.0.1:9090/metrics', timeout=3) as response:
+                      metrics = response.read().decode()
+                  for line in metrics.splitlines():
+                      if line.startswith('nitromta_attempts_total{') and 'result="delivered"' in line and float(line.rsplit(' ', 1)[-1]) >= 1:
+                          delivered = True
+                          observations.append('The engine reported a completed real delivery: '+line)
+                          break
+                  if delivered: break
+                  time.sleep(3)
+              queue = run([binary, 'queue', '--config', 'config.toml', '--json'])
+              observations.append('Final queue diagnostic: '+queue.strip())
+              if not delivered: observations.append('No completed delivery was observed within three minutes. SMTP acceptance alone is not a delivery receipt.')
+          finally:
+              engine.terminate()
+              try: engine.wait(timeout=25)
+              except subprocess.TimeoutExpired: engine.kill(); engine.wait()
+              log.close()
+              elapsed = time.monotonic()-started
+              # Only process logs, never the configuration, keys, store or admin answers.
+              logtext = pathlib.Path('engine.log').read_text(errors='replace')
+              if 'password' in locals(): logtext = logtext.replace(password, '[REDACTED]')
+              (root/'engine-log.txt').write_text(logtext)
+              lines = ['# NitroMTA 0.2.1 delivery verification', '', '- Started (UTC): '+stamp, '- Environment: GitHub-hosted Ubuntu 24.04, '+platform.machine()+', Python '+platform.python_version()+'. This was a remote ephemeral runner, not the Windows desktop.', '- Engine: '+version, '- Elapsed: '+str(round(elapsed,2))+' seconds.', '- Installation: official x86_64 archive; GitHub provenance verified before execution.', '- Result: '+('real delivery observed by engine metrics; the external receipt is still to be checked in the Reply-To inbox.' if delivered else 'no real delivery confirmed; not a completed delivery proof.'), '']
+              lines += ['- '+item for item in observations]
+              lines += ['', '## Commands actually run', 'Private key and generated login values are intentionally excluded.', '```text']+commands+['```', '', '## Scope and limitations', '- No domain DNS, SPF, DMARC or production deliverability certification was performed. The proof destination permits a test identity.', '- No marketing recipients, paid service, new cloud account, privileged installation or money transfer was used.', '- The temporary runner and its local credentials end with the job.']
+              report='\n'.join(lines)+'\n'
+              (root/'report.md').write_text(report)
+              print(report)
+              with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as summary: summary.write(report)
+          if not delivered: raise SystemExit('Delivery not confirmed; inspect diagnostics, do not claim completion.')
+          PY
+      - name: Preserve sanitized evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nitromta-verification-evidence
+          path: |
+            report.md
+            engine-log.txt
+          if-no-files-found: warn
+          retention-days: 7
